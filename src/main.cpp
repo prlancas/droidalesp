@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
@@ -40,8 +39,22 @@ rcl_allocator_t allocator;
 rcl_node_t node;
 rcl_timer_t timer;
 
+bool ros_initialized = false;
+char status_buffer[64];
+
+const char* initString = "w axis1.controller.config.control_mode 3\n\
+w axis1.controller.config.input_mode 1\n\
+w axis1.requested_state 8\n\
+w axis0.controller.config.control_mode 3\n\
+w axis0.controller.config.input_mode 1\n\
+w axis0.requested_state 8\n\
+w axis0.controller.config.pos_gain 60\n\
+w axis0.controller.config.vel_gain 0.08\n\
+w axis1.controller.config.pos_gain 60\n\
+w axis1.controller.config.vel_gain 0.08\n";
+
+
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){Serial.printf("Failed status on line %d: %d. Aborting.\n",__LINE__,(int)temp_rc);}}
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){Serial.printf("Soft error on line %d: %d.\n",__LINE__,(int)temp_rc);}}
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -122,10 +135,10 @@ void subscription_callback(const void * msgin) {
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   if (timer != NULL) {
     char feedback[64];
-    snprintf(feedback, sizeof(feedback), "Pos0: %.2f Pos1: %.2f", currentTargetPos0, currentTargetPos1);
+    snprintf(feedback, sizeof(feedback), "P0:%.2f P1:%.2f", currentTargetPos0, currentTargetPos1);
     msg_pub.data.data = feedback;
     msg_pub.data.size = strlen(feedback);
-    RCSOFTCHECK(rcl_publish(&publisher, &msg_pub, NULL));
+    rcl_publish(&publisher, &msg_pub, NULL);
   }
 }
 
@@ -137,25 +150,36 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) { delay(500); }
 
+  Serial.println("\nWiFi Connected. IP: " + WiFi.localIP().toString());
+
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASS);
   ArduinoOTA.begin();
 
+  // Try micro-ROS init
+  Serial.println("Attempting micro-ROS connection to Agent...");
   set_microros_wifi_transports((char*)WIFI_SSID, (char*)WIFI_PASS, (char*)AGENT_IP, AGENT_PORT);
+
   allocator = rcl_get_default_allocator();
+  if (rclc_support_init(&support, 0, NULL, &allocator) == RCL_RET_OK) {
+      if (rclc_node_init_default(&node, "droidal", "", &support) == RCL_RET_OK) {
+          rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
+          rclc_publisher_init_default(&publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "odrive_status");
 
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-  RCCHECK(rclc_node_init_default(&node, "base", "", &support));
+                    // Setup string message capacity
+          msg_pub.data.data = status_buffer;
+          msg_pub.data.capacity = sizeof(status_buffer);
 
-  RCCHECK(rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel"));
-  RCCHECK(rclc_publisher_init_default(&publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "odrive_status"));
-
-  const unsigned int timer_timeout = 100;
-  RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(timer_timeout), timer_callback));
-
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg_sub, &subscription_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_timer(&executor, &timer));
+          rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(100), timer_callback);
+          rclc_executor_init(&executor, &support.context, 2, &allocator);
+          rclc_executor_add_subscription(&executor, &subscriber, &msg_sub, &subscription_callback, ON_NEW_DATA);
+          rclc_executor_add_timer(&executor, &timer);
+          ros_initialized = true;
+          Serial.println("micro-ROS fully initialized!");
+      }
+  } else {
+      Serial.println("micro-ROS Agent NOT found. Continuing with Web/Telnet only.");
+  }
 
   webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ request->send_P(200, "text/html", index_html); });
   webServer.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -164,11 +188,16 @@ void setup() {
 
   webServer.begin();
   telnetServer.begin();
+
+  odriveSerial.write(initString);
 }
 
 void loop() {
   ArduinoOTA.handle();
-  RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10)));
+  
+  if (ros_initialized) {
+    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+  }
 
   if (telnetServer.hasClient()) {
     if (!telnetClient || !telnetClient.connected()) {
