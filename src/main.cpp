@@ -153,7 +153,7 @@ void setup() {
   });
   webServer.begin();
   telnetServer.begin();
-  delay(1000);
+  delay(30000);
   odriveSerial.print(initString);
 }
 
