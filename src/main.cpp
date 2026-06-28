@@ -28,6 +28,7 @@ float currentTargetPos0 = 0;
 float currentTargetPos1 = 0;
 float actualPos0 = 0;
 float actualPos1 = 0;
+float globalSensitivity = 0.5; // Default sensitivity (0.1 to 1.0)
 String inputBuffer = "";
 String odriveResponseBuffer = "";
 
@@ -46,41 +47,77 @@ bool ros_initialized = false;
 char status_buffer[64];
 
 unsigned long lastUpdate = 0;
-int feedbackState = 0; // 0: Idle, 1: Waiting for Axis 0, 2: Waiting for Axis 1
+int feedbackState = 0; 
 
+// Initial safe configuration
 const char* initString = "w axis0.controller.config.control_mode 3\n\
 w axis0.controller.config.input_mode 5\n\
+w axis0.trap_traj.config.vel_limit 1.0\n\
+w axis0.trap_traj.config.accel_limit 0.2\n\
+w axis0.trap_traj.config.decel_limit 0.2\n\
 w axis0.requested_state 8\n\
 w axis1.controller.config.control_mode 3\n\
 w axis1.controller.config.input_mode 5\n\
+w axis1.trap_traj.config.vel_limit 1.0\n\
+w axis1.trap_traj.config.accel_limit 0.2\n\
+w axis1.trap_traj.config.decel_limit 0.2\n\
 w axis1.requested_state 8\n";
-
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){Serial.printf("ROS Error: %d\n", (int)temp_rc);}}
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html><head><title>Drodal Remote</title><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<style>body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #121212; color: white; margin: 0; overflow: hidden; }
-.grid { display: grid; grid-template-columns: repeat(3, 80px); grid-template-rows: repeat(3, 80px); gap: 20px; }
-button { width: 100%; height: 100%; border: none; border-radius: 15px; font-size: 24px; font-weight: bold; cursor: pointer; transition: transform 0.1s, background 0.2s; touch-action: manipulation; }
-button:active { transform: scale(0.9); }
-.dir { background: #333; color: white; }
-.stop { background: #ff3b30; color: white; grid-column: 2; grid-row: 2; font-size: 32px; }
-h2 { margin-bottom: 20px; color: #aaa; }</style></head>
-<body><h2>ODrive Control</h2><div class="grid">
-<button class="dir" style="grid-column:2;grid-row:1" onclick="send('f')">▲</button>
-<button class="dir" style="grid-column:1;grid-row:2" onclick="send('l')">◀</button>
-<button class="stop" onclick="send('s')">S</button>
-<button class="dir" style="grid-column:3;grid-row:2" onclick="send('r')">▶</button>
-<button class="dir" style="grid-column:2;grid-row:3" onclick="send('b')">▼</button>
-</div><script>function send(cmd) { fetch(`/cmd?v=${cmd}`).catch(err => console.log(err)); }</script></body></html>
+<html><head><title>Drodal Remote</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<style>
+  body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #121212; color: white; margin: 0; overflow: hidden; }
+  .grid { display: grid; grid-template-columns: repeat(3, 80px); grid-template-rows: repeat(3, 80px); gap: 20px; margin-bottom: 30px;}
+  button { width: 100%; height: 100%; border: none; border-radius: 15px; font-size: 24px; font-weight: bold; cursor: pointer; transition: transform 0.1s, background 0.2s; touch-action: manipulation; }
+  button:active { transform: scale(0.9); }
+  .dir { background: #333; color: white; }
+  .stop { background: #ff3b30; color: white; grid-column: 2; grid-row: 2; font-size: 32px; }
+  .slider-container { width: 280px; text-align: center; background: #1e1e1e; padding: 20px; border-radius: 20px; }
+  input[type=range] { width: 100%; margin: 15px 0; }
+  h2 { margin: 0 0 10px 0; color: #aaa; font-size: 18px; }
+  label { font-size: 14px; color: #888; }
+</style></head>
+<body>
+  <div class="grid">
+    <button class="dir" style="grid-column:2;grid-row:1" onclick="send('f')">▲</button>
+    <button class="dir" style="grid-column:1;grid-row:2" onclick="send('l')">◀</button>
+    <button class="stop" onclick="send('s')">S</button>
+    <button class="dir" style="grid-column:3;grid-row:2" onclick="send('r')">▶</button>
+    <button class="dir" style="grid-column:2;grid-row:3" onclick="send('b')">▼</button>
+  </div>
+  <div class="slider-container">
+    <h2>Drive Sensitivity</h2>
+    <input type="range" min="1" max="100" value="50" id="sensSlider" onchange="updateSens(this.value)">
+    <label>Tame (Low Volt) &larr; &rarr; Aggressive (Full Volt)</label>
+  </div>
+<script>
+  function send(cmd) { fetch(`/cmd?v=${cmd}`).catch(err => console.log(err)); }
+  function updateSens(val) { fetch(`/sens?v=${val/100}`).catch(err => console.log(err)); }
+</script>
+</body></html>
 )rawliteral";
+
+void applySensitivity(float sens) {
+  globalSensitivity = sens;
+  float vel = sens * 4.0f;     
+  float accel = sens * 1.5f;   
+  
+  odriveSerial.printf("w axis0.trap_traj.config.vel_limit %.2f\n", vel);
+  odriveSerial.printf("w axis0.trap_traj.config.accel_limit %.2f\n", accel);
+  odriveSerial.printf("w axis0.trap_traj.config.decel_limit %.2f\n", accel);
+  odriveSerial.printf("w axis1.trap_traj.config.vel_limit %.2f\n", vel);
+  odriveSerial.printf("w axis1.trap_traj.config.accel_limit %.2f\n", accel);
+  odriveSerial.printf("w axis1.trap_traj.config.decel_limit %.2f\n", accel);
+  
+  Serial.printf("Sensitivity updated: Vel=%.2f, Accel=%.2f\n", vel, accel);
+}
 
 void processCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
-  // Sync setpoints to current estimate to prevent jumps
   currentTargetPos0 = actualPos0;
   currentTargetPos1 = actualPos1;
 
@@ -89,11 +126,18 @@ void processCommand(String cmd) {
   odriveSerial.println("w axis1.controller.config.control_mode 3");
   odriveSerial.println("w axis1.controller.config.input_mode 5");
 
-  if (cmd == "f") { currentTargetPos0 -= 1.0; currentTargetPos1 += 1.0; } 
-  else if (cmd == "b") { currentTargetPos0 += 1.0; currentTargetPos1 -= 1.0; } 
-  else if (cmd == "l") { currentTargetPos0 -= 0.28; currentTargetPos1 -= 0.28; }
-  else if (cmd == "r") { currentTargetPos0 += 0.28; currentTargetPos1 += 0.28; }
-  else if (cmd == "s") { odriveSerial.println("v 0 0"); odriveSerial.println("v 1 0"); return; } 
+  float step = 0.2f + (globalSensitivity * 0.8f); 
+  float turn = 0.1f + (globalSensitivity * 0.2f);
+
+  if (cmd == "f") { currentTargetPos0 -= step; currentTargetPos1 += step; } 
+  else if (cmd == "b") { currentTargetPos0 += step; currentTargetPos1 -= step; } 
+  else if (cmd == "l") { currentTargetPos0 -= turn; currentTargetPos1 -= turn; }
+  else if (cmd == "r") { currentTargetPos0 += turn; currentTargetPos1 += turn; }
+  else if (cmd == "s") { 
+    odriveSerial.println("v 0 0"); 
+    odriveSerial.println("v 1 0"); 
+    return; 
+  } 
   else { odriveSerial.println(cmd); return; }
 
   odriveSerial.printf("t 0 %.2f\n", currentTargetPos0);
@@ -118,6 +162,37 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
     snprintf(status_buffer, sizeof(status_buffer), "A0:%.2f A1:%.2f", actualPos0, actualPos1);
     msg_pub.data.size = strlen(status_buffer);
     rcl_publish(&publisher, &msg_pub, NULL);
+  }
+}
+
+void handleOdriveTraffic() {
+  if (millis() - lastUpdate > 100 && feedbackState == 0) {
+    odriveSerial.println("r axis0.encoder.pos_estimate");
+    feedbackState = 1;
+    lastUpdate = millis();
+  }
+
+  while (odriveSerial.available()) {
+    char c = odriveSerial.read();
+    if (c == '\n' || c == '\r') {
+      if (odriveResponseBuffer.length() > 0) {
+        if (feedbackState == 1) {
+          actualPos0 = odriveResponseBuffer.toFloat();
+          odriveSerial.println("r axis1.encoder.pos_estimate");
+          feedbackState = 2;
+        } else if (feedbackState == 2) {
+          actualPos1 = odriveResponseBuffer.toFloat();
+          feedbackState = 0;
+        } else {
+          if (telnetClient && telnetClient.connected()) {
+            telnetClient.println(odriveResponseBuffer);
+          }
+        }
+        odriveResponseBuffer = "";
+      }
+    } else {
+      odriveResponseBuffer += c;
+    }
   }
 }
 
@@ -146,49 +221,28 @@ void setup() {
           ros_initialized = true;
       }
   }
-
-  webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ request->send_P(200, "text/html", index_html); });
+  
+  webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ 
+    request->send_P(200, "text/html", index_html); 
+  });
+  
   webServer.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("v")) { processCommand(request->getParam("v")->value()); request->send(200, "text/plain", "OK"); }
   });
+
+  webServer.on("/sens", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("v")) { 
+      applySensitivity(request->getParam("v")->value().toFloat()); 
+      request->send(200, "text/plain", "OK"); 
+    }
+  });
+
   webServer.begin();
   telnetServer.begin();
-  delay(30000);
+  
+  delay(15000); 
   odriveSerial.print(initString);
-}
-
-void handleOdriveTraffic() {
-  // 1. Send periodic requests for position if idle
-  if (millis() - lastUpdate > 100 && feedbackState == 0) {
-    odriveSerial.println("r axis0.encoder.pos_estimate");
-    feedbackState = 1;
-    lastUpdate = millis();
-  }
-
-  // 2. Read incoming data from ODrive
-  while (odriveSerial.available()) {
-    char c = odriveSerial.read();
-    if (c == '\n' || c == '\r') {
-      if (odriveResponseBuffer.length() > 0) {
-        if (feedbackState == 1) {
-          actualPos0 = odriveResponseBuffer.toFloat();
-          odriveSerial.println("r axis1.encoder.pos_estimate");
-          feedbackState = 2;
-        } else if (feedbackState == 2) {
-          actualPos1 = odriveResponseBuffer.toFloat();
-          feedbackState = 0;
-        } else {
-          // Unexpected data or response to Telnet command - forward to Telnet
-          if (telnetClient && telnetClient.connected()) {
-            telnetClient.println(odriveResponseBuffer);
-          }
-        }
-        odriveResponseBuffer = "";
-      }
-    } else {
-      odriveResponseBuffer += c;
-    }
-  }
+  applySensitivity(0.5); 
 }
 
 void loop() {
@@ -204,14 +258,11 @@ void loop() {
     } else { telnetServer.available().stop(); }
   }
 
-  // Forward Telnet input to ODrive
   if (telnetClient && telnetClient.connected() && telnetClient.available()) {
     while (telnetClient.available()) {
       char c = telnetClient.read();
       if (c == '\n' || c == '\r') {
         if (inputBuffer.length() > 0) {
-          // If the user manually typed a command, we temporarily pause telemetry 
-          // to ensure we don't mix up the response
           feedbackState = 0; 
           odriveSerial.println(inputBuffer);
           inputBuffer = "";
