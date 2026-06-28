@@ -18,8 +18,6 @@
 #include <geometry_msgs/msg/twist.h>
 
 // ODrive & Network Objects
-WiFiServer telnetServer(23);
-WiFiClient telnetClient;
 AsyncWebServer webServer(80);
 HardwareSerial odriveSerial(2);
 
@@ -28,9 +26,26 @@ float currentTargetPos0 = 0;
 float currentTargetPos1 = 0;
 float actualPos0 = 0;
 float actualPos1 = 0;
-float globalSensitivity = 0.5; // Default sensitivity (0.1 to 1.0)
-String inputBuffer = "";
+// Default sensitivity (0.01 to 1.0). Kept intentionally LOW for safety:
+// the robot is heavy and powerful, so it starts tame and is turned up by hand.
+float globalSensitivity = 0.10f;
+// Scales how far a single button click travels (0.05 = tiny nudge, 1.0 = full step).
+float stepScale = 1.0f;
 String odriveResponseBuffer = "";
+
+// In-browser ODrive console. When enabled, odometry polling is paused so that
+// raw command replies don't corrupt the encoder-position parser.
+bool consoleMode = false;
+String consoleLog = "";
+
+void appendConsoleLog(const String &line) {
+  consoleLog += line;
+  consoleLog += '\n';
+  // Keep the buffer bounded so it can't grow without limit.
+  if (consoleLog.length() > 4000) {
+    consoleLog = consoleLog.substring(consoleLog.length() - 3000);
+  }
+}
 
 // micro-ROS Objects
 rcl_subscription_t subscriber;
@@ -65,53 +80,133 @@ w axis1.requested_state 8\n";
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html><head><title>Drodal Remote</title>
+<html><head><title>Droidal Remote</title>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <style>
-  body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #121212; color: white; margin: 0; overflow: hidden; }
-  .grid { display: grid; grid-template-columns: repeat(3, 80px); grid-template-rows: repeat(3, 80px); gap: 20px; margin-bottom: 30px;}
+  body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; height: 100vh; background: #121212; color: white; margin: 0; padding: 16px 0; box-sizing: border-box; overflow-y: auto; }
+  .grid { display: grid; grid-template-columns: repeat(3, 80px); grid-template-rows: repeat(3, 80px); gap: 20px; margin-bottom: 24px;}
   button { width: 100%; height: 100%; border: none; border-radius: 15px; font-size: 24px; font-weight: bold; cursor: pointer; transition: transform 0.1s, background 0.2s; touch-action: manipulation; }
   button:active { transform: scale(0.9); }
   .dir { background: #333; color: white; }
   .stop { background: #ff3b30; color: white; grid-column: 2; grid-row: 2; font-size: 32px; }
-  .slider-container { width: 280px; text-align: center; background: #1e1e1e; padding: 20px; border-radius: 20px; }
-  input[type=range] { width: 100%; margin: 15px 0; }
-  h2 { margin: 0 0 10px 0; color: #aaa; font-size: 18px; }
-  label { font-size: 14px; color: #888; }
+  .slider-container { width: 280px; text-align: center; background: #1e1e1e; padding: 16px 20px; border-radius: 20px; margin-bottom: 16px; }
+  input[type=range] { width: 100%; margin: 12px 0; }
+  h2 { margin: 0 0 6px 0; color: #aaa; font-size: 18px; }
+  .val { color: #4caf50; font-weight: bold; }
+  label { font-size: 13px; color: #888; }
+  .console { width: 280px; background: #1e1e1e; padding: 16px 20px; border-radius: 20px; }
+  #consoleToggle { background: #555; color: #fff; height: 44px; font-size: 16px; border-radius: 12px; margin-bottom: 12px; }
+  #consoleToggle.on { background: #ff9500; }
+  #log { background: #000; color: #0f0; font-family: monospace; font-size: 12px; text-align: left; height: 160px; overflow-y: auto; padding: 8px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  #cmdIn { flex: 1; border-radius: 8px; border: none; padding: 8px; font-size: 14px; }
+  #sendBtn { width: 70px; height: 38px; font-size: 14px; border-radius: 8px; background: #0a84ff; color: #fff; }
+  .hidden { display: none; }
 </style></head>
 <body>
   <div class="grid">
-    <button class="dir" style="grid-column:2;grid-row:1" onclick="send('f')">▲</button>
-    <button class="dir" style="grid-column:1;grid-row:2" onclick="send('l')">◀</button>
-    <button class="stop" onclick="send('s')">S</button>
-    <button class="dir" style="grid-column:3;grid-row:2" onclick="send('r')">▶</button>
-    <button class="dir" style="grid-column:2;grid-row:3" onclick="send('b')">▼</button>
+    <button class="dir" style="grid-column:2;grid-row:1" onclick="send('f')">&#9650;</button>
+    <button class="dir" style="grid-column:1;grid-row:2" onclick="send('l')">&#9664;</button>
+    <button class="stop" onclick="send('s')">STOP</button>
+    <button class="dir" style="grid-column:3;grid-row:2" onclick="send('r')">&#9654;</button>
+    <button class="dir" style="grid-column:2;grid-row:3" onclick="send('b')">&#9660;</button>
   </div>
+
   <div class="slider-container">
-    <h2>Drive Sensitivity</h2>
-    <input type="range" min="1" max="100" value="50" id="sensSlider" onchange="updateSens(this.value)">
-    <label>Tame (Low Volt) &larr; &rarr; Aggressive (Full Volt)</label>
+    <h2>Drive Power <span class="val" id="sensVal">10%</span></h2>
+    <input type="range" min="1" max="100" value="10" id="sensSlider" oninput="updateSens(this.value)">
+    <label>Tame &amp; Safe &larr;&nbsp;&nbsp;&rarr; Aggressive (Full Power)</label>
   </div>
+
+  <div class="slider-container">
+    <h2>Step Size <span class="val" id="stepVal">100%</span></h2>
+    <input type="range" min="5" max="100" value="100" id="stepSlider" oninput="updateStep(this.value)">
+    <label>Tiny Nudge &larr;&nbsp;&nbsp;&rarr; Full Step Per Click</label>
+  </div>
+
+  <div class="console">
+    <button id="consoleToggle" onclick="toggleConsole()">ODrive Console: OFF</button>
+    <div id="consoleBody" class="hidden">
+      <div id="log"></div>
+      <div class="row">
+        <input id="cmdIn" placeholder="e.g. r vbus_voltage" onkeydown="if(event.key=='Enter')sendCmd()">
+        <button id="sendBtn" onclick="sendCmd()">Send</button>
+      </div>
+      <label>Odometry is paused while the console is ON.</label>
+    </div>
+  </div>
+
 <script>
-  function send(cmd) { fetch(`/cmd?v=${cmd}`).catch(err => console.log(err)); }
-  function updateSens(val) { fetch(`/sens?v=${val/100}`).catch(err => console.log(err)); }
+  function send(cmd) { fetch('/cmd?v=' + cmd).catch(e => {}); }
+  function updateSens(val) {
+    document.getElementById('sensVal').textContent = val + '%';
+    fetch('/sens?v=' + (val/100)).catch(e => {});
+  }
+  function updateStep(val) {
+    document.getElementById('stepVal').textContent = val + '%';
+    fetch('/step?v=' + (val/100)).catch(e => {});
+  }
+
+  var consoleOn = false, logTimer = null;
+  function toggleConsole() {
+    consoleOn = !consoleOn;
+    var btn = document.getElementById('consoleToggle');
+    btn.textContent = 'ODrive Console: ' + (consoleOn ? 'ON' : 'OFF');
+    btn.classList.toggle('on', consoleOn);
+    document.getElementById('consoleBody').classList.toggle('hidden', !consoleOn);
+    fetch('/console/toggle?on=' + (consoleOn ? '1' : '0')).catch(e => {});
+    if (consoleOn) { logTimer = setInterval(pollLog, 400); }
+    else { clearInterval(logTimer); }
+  }
+  function pollLog() {
+    fetch('/console/log').then(r => r.text()).then(t => {
+      if (t.length) {
+        var el = document.getElementById('log');
+        el.textContent += t;
+        el.scrollTop = el.scrollHeight;
+      }
+    }).catch(e => {});
+  }
+  function sendCmd() {
+    var i = document.getElementById('cmdIn');
+    if (!i.value.trim()) return;
+    fetch('/console/send?cmd=' + encodeURIComponent(i.value)).catch(e => {});
+    i.value = '';
+  }
 </script>
 </body></html>
 )rawliteral";
 
 void applySensitivity(float sens) {
+  if (sens < 0.01f) sens = 0.01f;
+  if (sens > 1.0f) sens = 1.0f;
   globalSensitivity = sens;
-  float vel = sens * 4.0f;     
-  float accel = sens * 1.5f;   
-  
-  odriveSerial.printf("w axis0.trap_traj.config.vel_limit %.2f\n", vel);
-  odriveSerial.printf("w axis0.trap_traj.config.accel_limit %.2f\n", accel);
-  odriveSerial.printf("w axis0.trap_traj.config.decel_limit %.2f\n", accel);
-  odriveSerial.printf("w axis1.trap_traj.config.vel_limit %.2f\n", vel);
-  odriveSerial.printf("w axis1.trap_traj.config.accel_limit %.2f\n", accel);
-  odriveSerial.printf("w axis1.trap_traj.config.decel_limit %.2f\n", accel);
-  
-  Serial.printf("Sensitivity updated: Vel=%.2f, Accel=%.2f\n", vel, accel);
+
+  // Trajectory limits: how fast/hard the planned move is.
+  float vel   = 0.5f + sens * 4.0f;
+  float accel = 0.3f + sens * 2.0f;
+
+  // Closed-loop gains: THIS is what actually causes the "overshoot then
+  // oscillate harder and harder" behaviour at full battery. A stiff pos_gain
+  // fights the robot's momentum and rings. Scaling the gains down at low
+  // power keeps the response soft and stable; turn the slider up only when
+  // you're in control and want a snappier (stiffer) response.
+  float pos_gain   = 1.0f + sens * 14.0f;   // soft (~1) .. firm (~15)
+  float vel_gain   = 0.04f + sens * 0.12f;
+  float vel_igain  = 0.05f + sens * 0.20f;
+
+  for (int a = 0; a <= 1; a++) {
+    odriveSerial.printf("w axis%d.trap_traj.config.vel_limit %.2f\n", a, vel);
+    odriveSerial.printf("w axis%d.trap_traj.config.accel_limit %.2f\n", a, accel);
+    odriveSerial.printf("w axis%d.trap_traj.config.decel_limit %.2f\n", a, accel);
+    odriveSerial.printf("w axis%d.controller.config.pos_gain %.3f\n", a, pos_gain);
+    odriveSerial.printf("w axis%d.controller.config.vel_gain %.3f\n", a, vel_gain);
+    odriveSerial.printf("w axis%d.controller.config.vel_integrator_gain %.3f\n", a, vel_igain);
+  }
+
+  Serial.printf("Sensitivity %.2f -> vel=%.2f accel=%.2f pos_gain=%.2f vel_gain=%.3f\n",
+                sens, vel, accel, pos_gain, vel_gain);
 }
 
 void processCommand(String cmd) {
@@ -126,8 +221,10 @@ void processCommand(String cmd) {
   odriveSerial.println("w axis1.controller.config.control_mode 3");
   odriveSerial.println("w axis1.controller.config.input_mode 5");
 
-  float step = 0.2f + (globalSensitivity * 0.8f); 
-  float turn = 0.1f + (globalSensitivity * 0.2f);
+  // Base distance per click, then scaled by the Step Size slider so one click
+  // can be a full move (1.0) or a tiny nudge (down to 0.05).
+  float step = (0.2f + (globalSensitivity * 0.8f)) * stepScale;
+  float turn = (0.1f + (globalSensitivity * 0.2f)) * stepScale;
 
   if (cmd == "f") { currentTargetPos0 -= step; currentTargetPos1 += step; } 
   else if (cmd == "b") { currentTargetPos0 += step; currentTargetPos1 -= step; } 
@@ -166,7 +263,9 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
 }
 
 void handleOdriveTraffic() {
-  if (millis() - lastUpdate > 100 && feedbackState == 0) {
+  // Pause odometry polling while the web console is active so that raw command
+  // replies don't get misread as encoder positions.
+  if (!consoleMode && millis() - lastUpdate > 100 && feedbackState == 0) {
     odriveSerial.println("r axis0.encoder.pos_estimate");
     feedbackState = 1;
     lastUpdate = millis();
@@ -176,17 +275,15 @@ void handleOdriveTraffic() {
     char c = odriveSerial.read();
     if (c == '\n' || c == '\r') {
       if (odriveResponseBuffer.length() > 0) {
-        if (feedbackState == 1) {
+        if (consoleMode) {
+          appendConsoleLog(odriveResponseBuffer);
+        } else if (feedbackState == 1) {
           actualPos0 = odriveResponseBuffer.toFloat();
           odriveSerial.println("r axis1.encoder.pos_estimate");
           feedbackState = 2;
         } else if (feedbackState == 2) {
           actualPos1 = odriveResponseBuffer.toFloat();
           feedbackState = 0;
-        } else {
-          if (telnetClient && telnetClient.connected()) {
-            telnetClient.println(odriveResponseBuffer);
-          }
         }
         odriveResponseBuffer = "";
       }
@@ -237,12 +334,49 @@ void setup() {
     }
   });
 
+  webServer.on("/step", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("v")) {
+      float s = request->getParam("v")->value().toFloat();
+      if (s < 0.05f) s = 0.05f;
+      if (s > 1.0f) s = 1.0f;
+      stepScale = s;
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // --- ODrive web console (replaces the old telnet passthrough) ---
+  webServer.on("/console/toggle", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("on")) {
+      consoleMode = (request->getParam("on")->value() == "1");
+      // Reset the odometry parser state so it resyncs cleanly afterwards.
+      feedbackState = 0;
+      odriveResponseBuffer = "";
+      appendConsoleLog(consoleMode ? "--- Console ON (odometry paused) ---"
+                                   : "--- Console OFF ---");
+    }
+    request->send(200, "text/plain", consoleMode ? "1" : "0");
+  });
+
+  webServer.on("/console/send", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (consoleMode && request->hasParam("cmd")) {
+      String c = request->getParam("cmd")->value();
+      appendConsoleLog("> " + c);
+      odriveSerial.println(c);
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  webServer.on("/console/log", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", consoleLog);
+    consoleLog = "";
+  });
+
   webServer.begin();
-  telnetServer.begin();
   
   delay(15000); 
   odriveSerial.print(initString);
-  applySensitivity(0.5); 
+  // Start tame: apply the low default power/gains so the robot is safe on boot.
+  applySensitivity(globalSensitivity);
 }
 
 void loop() {
@@ -250,24 +384,4 @@ void loop() {
   if (ros_initialized) { rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10)); }
 
   handleOdriveTraffic();
-
-  if (telnetServer.hasClient()) {
-    if (!telnetClient || !telnetClient.connected()) {
-      if (telnetClient) telnetClient.stop();
-      telnetClient = telnetServer.available();
-    } else { telnetServer.available().stop(); }
-  }
-
-  if (telnetClient && telnetClient.connected() && telnetClient.available()) {
-    while (telnetClient.available()) {
-      char c = telnetClient.read();
-      if (c == '\n' || c == '\r') {
-        if (inputBuffer.length() > 0) {
-          feedbackState = 0; 
-          odriveSerial.println(inputBuffer);
-          inputBuffer = "";
-        }
-      } else { inputBuffer += c; }
-    }
-  }
 }
