@@ -38,6 +38,15 @@ String odriveResponseBuffer = "";
 bool consoleMode = false;
 String consoleLog = "";
 
+// --- /cmd_vel safety watchdog ---------------------------------------------
+// Velocity-mode drive (from /cmd_vel) holds a speed until the next message, so
+// a dropped connection while moving would leave the robot running away. Track
+// the last /cmd_vel and, if it goes stale, command zero velocity. The web UI
+// drives in position mode and clears cmdVelActive so it isn't affected.
+const unsigned long CMDVEL_TIMEOUT_MS = 400;
+unsigned long lastCmdVelMs = 0;
+bool cmdVelActive = false;
+
 void appendConsoleLog(const String &line) {
   consoleLog += line;
   consoleLog += '\n';
@@ -213,6 +222,10 @@ void processCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
+  // Manual web control uses position mode; hand control back from any active
+  // /cmd_vel velocity drive so the watchdog doesn't fight it.
+  cmdVelActive = false;
+
   currentTargetPos0 = actualPos0;
   currentTargetPos1 = actualPos1;
 
@@ -252,6 +265,10 @@ void subscription_callback(const void * msgin) {
   float right_vel = msg->linear.x + msg->angular.z;
   odriveSerial.printf("v 0 %.2f\n", -left_vel);
   odriveSerial.printf("v 1 %.2f\n", right_vel);
+
+  // Feed the watchdog: a fresh /cmd_vel keeps velocity drive alive.
+  lastCmdVelMs = millis();
+  cmdVelActive = true;
 }
 
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
@@ -259,6 +276,15 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
     snprintf(status_buffer, sizeof(status_buffer), "A0:%.2f A1:%.2f", actualPos0, actualPos1);
     msg_pub.data.size = strlen(status_buffer);
     rcl_publish(&publisher, &msg_pub, NULL);
+  }
+}
+
+void handleCmdVelWatchdog() {
+  // If we're under velocity-mode drive and /cmd_vel has gone stale, stop.
+  if (cmdVelActive && (millis() - lastCmdVelMs > CMDVEL_TIMEOUT_MS)) {
+    odriveSerial.println("v 0 0");
+    odriveSerial.println("v 1 0");
+    cmdVelActive = false;
   }
 }
 
@@ -383,5 +409,6 @@ void loop() {
   ArduinoOTA.handle();
   if (ros_initialized) { rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10)); }
 
+  handleCmdVelWatchdog();
   handleOdriveTraffic();
 }

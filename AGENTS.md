@@ -44,6 +44,11 @@ This is a heavy, powerful machine. Behaviour is deliberately tame by default:
   instability, which is why the gains (not just speed limits) scale here.
 - Startup applies a **low** default sensitivity.
 - A separate **step-size** slider scales how far one button click travels.
+- **`/cmd_vel` watchdog:** velocity-mode drive holds a speed until the next
+  message, so a dropped link mid-move would run away. `handleCmdVelWatchdog()`
+  commands zero velocity if no `/cmd_vel` arrives within `CMDVEL_TIMEOUT_MS`
+  (400 ms). Any manual web command clears `cmdVelActive` so the watchdog never
+  fights position-mode driving.
 
 ## Build / flash
 ```bash
