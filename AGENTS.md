@@ -62,13 +62,30 @@ and routes all serial lines to a log the browser polls. There is intentionally
 **no telnet server** — it was removed because its replies fought the odometry
 parser.
 
+## Battery voltage (read / report / compensate)
+`handleOdriveTraffic()` polls `r vbus_voltage` after the two encoder reads
+(feedback state 0->1->2->3->0) into `batteryVoltage`. It's:
+- **reported** three ways: appended to `/odrive_status` as a `V:<volts>` token
+  (droidal_viz republishes it as `/battery_voltage`, `std_msgs/Float32`), shown
+  live in the web UI (`/volt` endpoint, polled every 2 s), and logged on the USB
+  serial.
+- **compensated for**: `voltageGainScale()` returns `VOLT_GAIN_REF / vbus`
+  (clamped `[VOLT_COMP_MIN, 1.0]`) and `applySensitivity()` multiplies the
+  closed-loop gains by it. Fully charged (~42 V) the base has far more torque
+  headroom and rings; scaling gains down keeps the feel constant as the pack
+  drains. Gains are re-applied automatically when `vbus` drifts > 0.5 V. Tune
+  `VOLT_GAIN_REF` (default 34 V) if it's still too lively when full.
+- Speed is capped **regardless** of voltage: trajectory `vel_limit` (web/position
+  mode) and a hard `MAX_WHEEL_TURNS` clamp in `subscription_callback` (velocity
+  mode). Future use: low-`/battery_voltage` return-to-base for auto-charging.
+
 ## Safety model
 This is a heavy, powerful machine. Behaviour is deliberately tame by default:
 - `applySensitivity()` scales ODrive `vel_limit`, `accel_limit`, **and the
-  closed-loop `pos_gain` / `vel_gain` / `vel_integrator_gain`** off one slider.
-  Low sensitivity = soft gains = no overshoot/oscillation. Turn it up only when
-  in control. The growing oscillation seen at full battery is a stiff-gain
-  instability, which is why the gains (not just speed limits) scale here.
+  closed-loop `pos_gain` / `vel_gain` / `vel_integrator_gain`** off one slider,
+  then multiplies the gains by the battery-voltage compensation above. Low
+  sensitivity = soft gains = no overshoot/oscillation. Turn it up only when in
+  control.
 - Startup applies a **low** default sensitivity.
 - A separate **step-size** slider scales how far one button click travels.
 - **`/cmd_vel` watchdog:** velocity-mode drive holds a speed until the next

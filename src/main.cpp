@@ -27,6 +27,11 @@ float currentTargetPos0 = 0;
 float currentTargetPos1 = 0;
 float actualPos0 = 0;
 float actualPos1 = 0;
+// Latest ODrive DC bus (battery) voltage, polled alongside the encoders.
+float batteryVoltage = 0.0f;
+// Voltage at which sensitivity was last (re)applied, so we only recompute the
+// gain compensation when the pack has drifted noticeably.
+float lastAppliedVoltage = 0.0f;
 // Default sensitivity (0.01 to 1.0). Kept intentionally LOW for safety:
 // the robot is heavy and powerful, so it starts tame and is turned up by hand.
 float globalSensitivity = 0.10f;
@@ -158,6 +163,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     <label>Tiny Nudge &larr;&nbsp;&nbsp;&rarr; Full Step Per Click</label>
   </div>
 
+  <div class="slider-container">
+    <h2>Battery <span class="val" id="voltVal">--.- V</span></h2>
+    <label>ODrive DC bus voltage</label>
+  </div>
+
   <div class="console">
     <button id="consoleToggle" onclick="toggleConsole()">ODrive Console: OFF</button>
     <div id="consoleBody" class="hidden">
@@ -180,6 +190,12 @@ const char index_html[] PROGMEM = R"rawliteral(
     document.getElementById('stepVal').textContent = val + '%';
     fetch('/step?v=' + (val/100)).catch(e => {});
   }
+  function pollVolt() {
+    fetch('/volt').then(r => r.text()).then(t => {
+      document.getElementById('voltVal').textContent = t + ' V';
+    }).catch(e => {});
+  }
+  setInterval(pollVolt, 2000); pollVolt();
 
   var consoleOn = false, logTimer = null;
   function toggleConsole() {
@@ -211,12 +227,30 @@ const char index_html[] PROGMEM = R"rawliteral(
 </body></html>
 )rawliteral";
 
+// Battery-voltage gain compensation. At low battery the motor voltage-saturates
+// so the drive feels tame; fully charged (~42 V) the same gains have far more
+// torque headroom and the base overshoots/oscillates. Scale the closed-loop
+// gains by (VOLT_GAIN_REF / vbus) so behaviour stays consistent as the pack
+// drains. Lower VOLT_GAIN_REF (or VOLT_COMP_MIN) if it's still too lively when
+// fully charged.
+const float VOLT_GAIN_REF = 34.0f;   // volts where the base tuning feels right
+const float VOLT_COMP_MIN = 0.5f;    // never cut gains below 50%
+
+float voltageGainScale() {
+  if (batteryVoltage < 1.0f) return 1.0f;   // no reading yet: don't compensate
+  float comp = VOLT_GAIN_REF / batteryVoltage;
+  if (comp > 1.0f) comp = 1.0f;             // don't boost gains above baseline
+  if (comp < VOLT_COMP_MIN) comp = VOLT_COMP_MIN;
+  return comp;
+}
+
 void applySensitivity(float sens) {
   if (sens < 0.01f) sens = 0.01f;
   if (sens > 1.0f) sens = 1.0f;
   globalSensitivity = sens;
 
-  // Trajectory limits: how fast/hard the planned move is.
+  // Trajectory limits: how fast/hard the planned move is. Independent of the
+  // battery so top speed is capped no matter how charged the pack is.
   float vel   = 0.5f + sens * 4.0f;
   float accel = 0.3f + sens * 2.0f;
 
@@ -224,10 +258,13 @@ void applySensitivity(float sens) {
   // oscillate harder and harder" behaviour at full battery. A stiff pos_gain
   // fights the robot's momentum and rings. Scaling the gains down at low
   // power keeps the response soft and stable; turn the slider up only when
-  // you're in control and want a snappier (stiffer) response.
-  float pos_gain   = 1.0f + sens * 14.0f;   // soft (~1) .. firm (~15)
-  float vel_gain   = 0.04f + sens * 0.12f;
-  float vel_igain  = 0.05f + sens * 0.20f;
+  // you're in control and want a snappier (stiffer) response. The extra
+  // voltage compensation keeps that feel constant across the charge range.
+  float gscale     = voltageGainScale();
+  float pos_gain   = (1.0f + sens * 14.0f) * gscale;   // soft (~1) .. firm (~15)
+  float vel_gain   = (0.04f + sens * 0.12f) * gscale;
+  float vel_igain  = (0.05f + sens * 0.20f) * gscale;
+  lastAppliedVoltage = batteryVoltage;
 
   for (int a = 0; a <= 1; a++) {
     odriveSerial.printf("w axis%d.trap_traj.config.vel_limit %.2f\n", a, vel);
@@ -238,8 +275,8 @@ void applySensitivity(float sens) {
     odriveSerial.printf("w axis%d.controller.config.vel_integrator_gain %.3f\n", a, vel_igain);
   }
 
-  Serial.printf("Sensitivity %.2f -> vel=%.2f accel=%.2f pos_gain=%.2f vel_gain=%.3f\n",
-                sens, vel, accel, pos_gain, vel_gain);
+  Serial.printf("Sensitivity %.2f (vbus=%.1f comp=%.2f) -> vel=%.2f accel=%.2f pos_gain=%.2f vel_gain=%.3f\n",
+                sens, batteryVoltage, gscale, vel, accel, pos_gain, vel_gain);
 }
 
 void processCommand(String cmd) {
@@ -310,6 +347,15 @@ void subscription_callback(const void * msgin) {
   float left  = left_ms  * TURNS_PER_M;             // ODrive velocity, turns/s
   float right = right_ms * TURNS_PER_M;
 
+  // Hard safety ceiling on wheel speed, independent of the commanded value or
+  // battery voltage (~2 turns/s = ~1.2 m/s wheel surface). Nav2 commands far
+  // less; this only catches a runaway/bad command.
+  const float MAX_WHEEL_TURNS = 2.0f;
+  if (left  >  MAX_WHEEL_TURNS) left  =  MAX_WHEEL_TURNS;
+  if (left  < -MAX_WHEEL_TURNS) left  = -MAX_WHEEL_TURNS;
+  if (right >  MAX_WHEEL_TURNS) right =  MAX_WHEEL_TURNS;
+  if (right < -MAX_WHEEL_TURNS) right = -MAX_WHEEL_TURNS;
+
   // Map wheel speeds to ODrive axes: axis 1 = LEFT wheel (forward = +cmd),
   // axis 0 = RIGHT wheel (mounted mirrored, forward = -cmd). If a single
   // direction comes out reversed on the robot, flip that axis's sign here.
@@ -323,7 +369,8 @@ void subscription_callback(const void * msgin) {
 
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   if (timer != NULL && ros_initialized) {
-    snprintf(status_buffer, sizeof(status_buffer), "A0:%.2f A1:%.2f", actualPos0, actualPos1);
+    snprintf(status_buffer, sizeof(status_buffer), "A0:%.2f A1:%.2f V:%.2f",
+             actualPos0, actualPos1, batteryVoltage);
     msg_pub.data.size = strlen(status_buffer);
     rcl_publish(&publisher, &msg_pub, NULL);
   }
@@ -425,6 +472,16 @@ void handleOdriveTraffic() {
           feedbackState = 2;
         } else if (feedbackState == 2) {
           actualPos1 = odriveResponseBuffer.toFloat();
+          odriveSerial.println("r vbus_voltage");
+          feedbackState = 3;
+        } else if (feedbackState == 3) {
+          float v = odriveResponseBuffer.toFloat();
+          if (v > 1.0f) batteryVoltage = v;   // ignore junk/empty replies
+          // Re-apply gains when the pack has drifted enough that the voltage
+          // compensation would change (battery moves slowly, so this is rare).
+          if (fabsf(batteryVoltage - lastAppliedVoltage) > 0.5f) {
+            applySensitivity(globalSensitivity);
+          }
           feedbackState = 0;
         }
         odriveResponseBuffer = "";
@@ -463,6 +520,12 @@ void setup() {
       applySensitivity(request->getParam("v")->value().toFloat()); 
       request->send(200, "text/plain", "OK"); 
     }
+  });
+
+  webServer.on("/volt", HTTP_GET, [](AsyncWebServerRequest *request){
+    char b[16];
+    snprintf(b, sizeof(b), "%.2f", batteryVoltage);
+    request->send(200, "text/plain", b);
   });
 
   webServer.on("/step", HTTP_GET, [](AsyncWebServerRequest *request){
