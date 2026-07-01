@@ -22,6 +22,13 @@ There are two independent ways to command the robot:
    `odrive_status` (`std_msgs/String`) with encoder positions. Talks to a
    micro-ROS agent over WiFi UDP (`AGENT_IP:AGENT_PORT`).
 
+   **Auto-reconnect:** `handleMicroRos()` runs a ping-based state machine
+   (`WAITING_AGENT -> AGENT_AVAILABLE -> AGENT_CONNECTED -> AGENT_DISCONNECTED`)
+   via `create_entities()` / `destroy_entities()`. If the agent (its container)
+   restarts, the ESP32 re-creates its ROS entities and resumes on its own — no
+   power-cycle needed. `setup()` only sets the transport; it no longer creates
+   entities inline.
+
 The GUI drives in **trajectory position mode** (`control_mode 3`, `input_mode
 5`): each button click nudges a target position. micro-ROS drives in **velocity
 mode** (`control_mode 2`, `input_mode 1`).

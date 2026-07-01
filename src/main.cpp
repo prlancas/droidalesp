@@ -16,6 +16,7 @@
 #include <rclc/executor.h>
 #include <std_msgs/msg/string.h>
 #include <geometry_msgs/msg/twist.h>
+#include <rmw_microros/rmw_microros.h>   // rmw_uros_ping_agent for reconnection
 
 // ODrive & Network Objects
 AsyncWebServer webServer(80);
@@ -69,6 +70,25 @@ rcl_timer_t timer;
 
 bool ros_initialized = false;
 char status_buffer[64];
+
+// --- micro-ROS agent reconnection state machine ---------------------------
+// Previously ROS was initialised once in setup(); if the agent (the
+// micro-ros-agent container) restarted, the ESP32 silently went mute until a
+// manual power-cycle. This state machine pings the agent, (re)creates the ROS
+// entities when it appears, and destroys them when it disappears, so the robot
+// reconnects on its own after any agent/stack restart.
+enum AgentState { WAITING_AGENT, AGENT_AVAILABLE, AGENT_CONNECTED, AGENT_DISCONNECTED };
+AgentState agentState = WAITING_AGENT;
+
+// Run statement X at most once every MS milliseconds (each call site keeps its
+// own timer). Used to throttle agent pings without blocking the main loop.
+#define EXECUTE_EVERY_N_MS(MS, X) do {                 \
+  static volatile unsigned long _last_run = 0;         \
+  if (millis() - _last_run > (unsigned long)(MS)) {    \
+    X;                                                 \
+    _last_run = millis();                              \
+  }                                                    \
+} while (0)
 
 unsigned long lastUpdate = 0;
 int feedbackState = 0; 
@@ -279,6 +299,72 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   }
 }
 
+// Create all ROS entities. Returns false (and leaves cleanup to the caller) if
+// any step fails, e.g. the agent vanished mid-handshake.
+bool create_entities() {
+  allocator = rcl_get_default_allocator();
+  if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) return false;
+  if (rclc_node_init_default(&node, "droidal", "", &support) != RCL_RET_OK) return false;
+  if (rclc_subscription_init_default(&subscriber, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "odrive_status") != RCL_RET_OK) return false;
+  if (rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(100), timer_callback) != RCL_RET_OK) return false;
+
+  executor = rclc_executor_get_zero_initialized_executor();
+  if (rclc_executor_init(&executor, &support.context, 2, &allocator) != RCL_RET_OK) return false;
+  rclc_executor_add_subscription(&executor, &subscriber, &msg_sub, &subscription_callback, ON_NEW_DATA);
+  rclc_executor_add_timer(&executor, &timer);
+
+  msg_pub.data.data = status_buffer;
+  msg_pub.data.capacity = sizeof(status_buffer);
+  msg_pub.data.size = 0;
+
+  ros_initialized = true;
+  return true;
+}
+
+// Tear down all ROS entities. Sets the session-destroy timeout to 0 first so we
+// don't block trying to cleanly close a session whose agent is already gone.
+void destroy_entities() {
+  ros_initialized = false;
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  rcl_timer_fini(&timer);
+  rclc_executor_fini(&executor);
+  rcl_subscription_fini(&subscriber, &node);
+  rcl_publisher_fini(&publisher, &node);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+}
+
+// Non-blocking agent connect/spin/reconnect, driven each loop().
+void handleMicroRos() {
+  switch (agentState) {
+    case WAITING_AGENT:
+      // Poll for an agent; cheap ping so the web UI/odometry stay responsive.
+      EXECUTE_EVERY_N_MS(500,
+        agentState = (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) ? AGENT_AVAILABLE : WAITING_AGENT;);
+      break;
+    case AGENT_AVAILABLE:
+      agentState = create_entities() ? AGENT_CONNECTED : WAITING_AGENT;
+      if (agentState == WAITING_AGENT) destroy_entities();  // roll back partial setup
+      break;
+    case AGENT_CONNECTED:
+      EXECUTE_EVERY_N_MS(1000,
+        agentState = (rmw_uros_ping_agent(150, 1) == RMW_RET_OK) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+      if (agentState == AGENT_CONNECTED) {
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+      }
+      break;
+    case AGENT_DISCONNECTED:
+      destroy_entities();
+      agentState = WAITING_AGENT;
+      break;
+  }
+}
+
 void handleCmdVelWatchdog() {
   // If we're under velocity-mode drive and /cmd_vel has gone stale, stop.
   if (cmdVelActive && (millis() - lastCmdVelMs > CMDVEL_TIMEOUT_MS)) {
@@ -328,22 +414,11 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) { delay(500); }
 
   ArduinoOTA.begin();
+  // Set up the micro-ROS transport once. ROS entity creation and reconnection
+  // are handled by the agent state machine in loop() (handleMicroRos), so the
+  // robot survives the agent/stack restarting without a power-cycle.
   set_microros_wifi_transports((char*)WIFI_SSID, (char*)WIFI_PASS, (char*)AGENT_IP, AGENT_PORT);
-
-  allocator = rcl_get_default_allocator();
-  if (rclc_support_init(&support, 0, NULL, &allocator) == RCL_RET_OK) {
-      if (rclc_node_init_default(&node, "droidal", "", &support) == RCL_RET_OK) {
-          rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
-          rclc_publisher_init_default(&publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "odrive_status");
-          msg_pub.data.data = status_buffer;
-          msg_pub.data.capacity = sizeof(status_buffer);
-          rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(100), timer_callback);
-          rclc_executor_init(&executor, &support.context, 2, &allocator);
-          rclc_executor_add_subscription(&executor, &subscriber, &msg_sub, &subscription_callback, ON_NEW_DATA);
-          rclc_executor_add_timer(&executor, &timer);
-          ros_initialized = true;
-      }
-  }
+  agentState = WAITING_AGENT;
   
   webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ 
     request->send_P(200, "text/html", index_html); 
@@ -407,7 +482,7 @@ void setup() {
 
 void loop() {
   ArduinoOTA.handle();
-  if (ros_initialized) { rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10)); }
+  handleMicroRos();   // connect to / spin / reconnect the micro-ROS agent
 
   handleCmdVelWatchdog();
   handleOdriveTraffic();
