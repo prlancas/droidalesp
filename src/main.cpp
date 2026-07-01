@@ -47,6 +47,10 @@ String consoleLog = "";
 const unsigned long CMDVEL_TIMEOUT_MS = 400;
 unsigned long lastCmdVelMs = 0;
 bool cmdVelActive = false;
+// True once the ODrive axes have been switched into velocity mode for /cmd_vel.
+// We only reconfigure the controller when this is false (entering velocity drive)
+// instead of on every message, which is what made the drive stutter.
+bool velModeActive = false;
 
 void appendConsoleLog(const String &line) {
   consoleLog += line;
@@ -243,8 +247,10 @@ void processCommand(String cmd) {
   if (cmd.length() == 0) return;
 
   // Manual web control uses position mode; hand control back from any active
-  // /cmd_vel velocity drive so the watchdog doesn't fight it.
+  // /cmd_vel velocity drive so the watchdog doesn't fight it. Also clear
+  // velModeActive so the next /cmd_vel re-arms velocity mode.
   cmdVelActive = false;
+  velModeActive = false;
 
   currentTargetPos0 = actualPos0;
   currentTargetPos1 = actualPos1;
@@ -276,15 +282,39 @@ void processCommand(String cmd) {
 
 void subscription_callback(const void * msgin) {
   const geometry_msgs__msg__Twist * msg = (const geometry_msgs__msg__Twist *)msgin;
-  odriveSerial.println("w axis0.controller.config.control_mode 2");
-  odriveSerial.println("w axis0.controller.config.input_mode 1");
-  odriveSerial.println("w axis1.controller.config.control_mode 2");
-  odriveSerial.println("w axis1.controller.config.input_mode 1");
 
-  float left_vel = msg->linear.x - msg->angular.z;
-  float right_vel = msg->linear.x + msg->angular.z;
-  odriveSerial.printf("v 0 %.2f\n", -left_vel);
-  odriveSerial.printf("v 1 %.2f\n", right_vel);
+  // Switch to velocity mode ONCE, not on every message. Rewriting control_mode /
+  // input_mode at the ~15 Hz command rate disturbed the ODrive velocity loop and
+  // made the base stutter ("tracing steps"). Only reconfigure when we're entering
+  // velocity-mode /cmd_vel control (e.g. after the web UI ran in position mode).
+  if (!velModeActive) {
+    odriveSerial.println("w axis0.controller.config.control_mode 2");
+    odriveSerial.println("w axis0.controller.config.input_mode 1");
+    odriveSerial.println("w axis1.controller.config.control_mode 2");
+    odriveSerial.println("w axis1.controller.config.input_mode 1");
+    velModeActive = true;
+  }
+
+  // Differential-drive mixing, REP-103 convention and proper SI units so it
+  // matches the metric odometry (droidal_viz) and Nav2's output:
+  //   linear.x  is m/s (+ = forward), angular.z is rad/s (+ = CCW / turn LEFT).
+  // Wheel geometry (keep in sync with droidal_viz.py): radius 0.095 m, base 0.43 m.
+  const float WHEEL_RADIUS_M = 0.095f;
+  const float WHEEL_BASE_M   = 0.43f;
+  const float TURNS_PER_M    = 1.0f / (2.0f * 3.14159265f * WHEEL_RADIUS_M);
+
+  float v = msg->linear.x;   // m/s
+  float w = msg->angular.z;  // rad/s
+  float left_ms  = v - w * (WHEEL_BASE_M * 0.5f);   // left wheel ground speed, m/s
+  float right_ms = v + w * (WHEEL_BASE_M * 0.5f);   // right wheel ground speed, m/s
+  float left  = left_ms  * TURNS_PER_M;             // ODrive velocity, turns/s
+  float right = right_ms * TURNS_PER_M;
+
+  // Map wheel speeds to ODrive axes: axis 1 = LEFT wheel (forward = +cmd),
+  // axis 0 = RIGHT wheel (mounted mirrored, forward = -cmd). If a single
+  // direction comes out reversed on the robot, flip that axis's sign here.
+  odriveSerial.printf("v 1 %.3f\n",  left);
+  odriveSerial.printf("v 0 %.3f\n", -right);
 
   // Feed the watchdog: a fresh /cmd_vel keeps velocity drive alive.
   lastCmdVelMs = millis();

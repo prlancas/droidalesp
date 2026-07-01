@@ -18,9 +18,9 @@ There are two independent ways to command the robot:
 1. **Web GUI** (`AsyncWebServer` on port 80) — the primary manual remote. Phone-
    friendly D-pad + sliders. This is the intended day-to-day control surface.
 2. **micro-ROS** (`micro_ros_arduino`) — subscribes to `cmd_vel`
-   (`geometry_msgs/Twist`) for autonomous/ROS control and publishes
-   `odrive_status` (`std_msgs/String`) with encoder positions. Talks to a
-   micro-ROS agent over WiFi UDP (`AGENT_IP:AGENT_PORT`).
+   (`geometry_msgs/Twist`) for autonomous/ROS control (Nav2 drives this) and
+   publishes `odrive_status` (`std_msgs/String`) with encoder positions. Talks to
+   a micro-ROS agent over WiFi UDP (`AGENT_IP:AGENT_PORT`).
 
    **Auto-reconnect:** `handleMicroRos()` runs a ping-based state machine
    (`WAITING_AGENT -> AGENT_AVAILABLE -> AGENT_CONNECTED -> AGENT_DISCONNECTED`)
@@ -32,6 +32,26 @@ There are two independent ways to command the robot:
 The GUI drives in **trajectory position mode** (`control_mode 3`, `input_mode
 5`): each button click nudges a target position. micro-ROS drives in **velocity
 mode** (`control_mode 2`, `input_mode 1`).
+
+### `/cmd_vel` contract (REP-103, SI) — the base is Nav2-ready
+`subscription_callback` treats `linear.x` as **m/s (+ = forward)** and
+`angular.z` as **rad/s (+ = CCW / turn left)**, per REP-103. It:
+- mixes diff-drive: `left = v - w*(base/2)`, `right = v + w*(base/2)` (m/s), then
+  converts to ODrive **turns/s** via `TURNS_PER_M = 1/(2*pi*WHEEL_RADIUS_M)`
+  (`WHEEL_RADIUS_M = 0.095`, `WHEEL_BASE_M = 0.43` — **keep in sync with
+  `droidal_viz.py`**);
+- maps to axes: **axis 1 = LEFT** wheel (`+cmd` forward), **axis 0 = RIGHT**
+  wheel (mirrored, `-cmd` forward). Flip a single axis's sign here if a direction
+  comes out reversed after reflashing.
+- **switches to velocity mode ONCE** (guarded by `velModeActive`) instead of
+  rewriting `control_mode`/`input_mode` every message — that per-message rewrite
+  was the "tracing steps" jerkiness. Any manual web command clears `velModeActive`
+  (and `cmdVelActive`) so the next `/cmd_vel` re-arms velocity mode.
+
+Historical: before this, `+angular.z` turned the robot CW (yaw decreased), so the
+old ROS-side `goto_goal` negated it. That hack is gone now that the firmware is
+correct — but it means changing these signs **invalidates the saved SLAM map**
+(rebuild it), and firmware + `droidal_viz` odometry signs must always match.
 
 ## Odometry vs. console (important)
 `handleOdriveTraffic()` continuously polls `axis*.encoder.pos_estimate` and
