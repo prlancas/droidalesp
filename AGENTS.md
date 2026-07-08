@@ -33,6 +33,16 @@ The GUI drives in **trajectory position mode** (`control_mode 3`, `input_mode
 5`): each button click nudges a target position. micro-ROS drives in **velocity
 mode** (`control_mode 2`, `input_mode 1`).
 
+**Velocity → position handoff (no "rush back" lurch):** after Nav2 has driven in
+velocity mode, the ODrive still holds a stale `input_pos` from the previous
+manual session. `processCommand` therefore re-enters position mode in a safe
+order: (1) select trap-traj `input_mode 5` first, (2) pin the trajectory target
+to the *current* encoder position (`actualPos0/1`, polled continuously) so there
+is nothing to rush toward, (3) only then set `control_mode 3`. Every manual move
+is thus **relative to where the robot actually is now**. Flipping `control_mode`
+to position while `input_mode` was still 1 (passthrough) is what previously made
+the wheels slam back to the old absolute position at full effort.
+
 ### `/cmd_vel` contract (REP-103, SI) — the base is Nav2-ready
 `subscription_callback` treats `linear.x` as **m/s (+ = forward)** and
 `angular.z` as **rad/s (+ = CCW / turn left)**, per REP-103. It:

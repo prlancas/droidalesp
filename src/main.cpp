@@ -289,32 +289,51 @@ void processCommand(String cmd) {
   cmdVelActive = false;
   velModeActive = false;
 
+  // Stop and raw-passthrough commands don't need the position-mode dance.
+  if (cmd == "s") {
+    odriveSerial.println("v 0 0");
+    odriveSerial.println("v 1 0");
+    return;
+  }
+  if (cmd != "f" && cmd != "b" && cmd != "l" && cmd != "r") {
+    odriveSerial.println(cmd);   // raw ODrive command passthrough
+    return;
+  }
+
+  // Fresh baseline from the live encoder estimate (polled continuously, even
+  // during Nav2 velocity drive), so every manual move is *relative to where the
+  // robot actually is now* rather than some old absolute position.
   currentTargetPos0 = actualPos0;
   currentTargetPos1 = actualPos1;
 
-  odriveSerial.println("w axis0.controller.config.control_mode 3");
+  // Enter position mode SAFELY. Order matters: after a Nav2 velocity drive the
+  // ODrive is in velocity mode with input_mode 1 (passthrough) and still holds
+  // a stale input_pos from the previous manual session. If control_mode is
+  // flipped to position first, the axis briefly servos to that stale setpoint at
+  // full effort -- the robot lurches back to where it used to be. So we:
+  //   1) select trap-traj input_mode 5 (velocity/accel limited) FIRST,
+  //   2) pin the trajectory target to the current position (overwrite the stale
+  //      input_pos so there is nothing to rush toward),
+  //   3) only then enable position control_mode 3.
   odriveSerial.println("w axis0.controller.config.input_mode 5");
-  odriveSerial.println("w axis1.controller.config.control_mode 3");
   odriveSerial.println("w axis1.controller.config.input_mode 5");
+  odriveSerial.printf("t 0 %.3f\n", currentTargetPos0);
+  odriveSerial.printf("t 1 %.3f\n", currentTargetPos1);
+  odriveSerial.println("w axis0.controller.config.control_mode 3");
+  odriveSerial.println("w axis1.controller.config.control_mode 3");
 
   // Base distance per click, then scaled by the Step Size slider so one click
   // can be a full move (1.0) or a tiny nudge (down to 0.05).
   float step = (0.2f + (globalSensitivity * 0.8f)) * stepScale;
   float turn = (0.1f + (globalSensitivity * 0.2f)) * stepScale;
 
-  if (cmd == "f") { currentTargetPos0 -= step; currentTargetPos1 += step; } 
-  else if (cmd == "b") { currentTargetPos0 += step; currentTargetPos1 -= step; } 
+  if (cmd == "f") { currentTargetPos0 -= step; currentTargetPos1 += step; }
+  else if (cmd == "b") { currentTargetPos0 += step; currentTargetPos1 -= step; }
   else if (cmd == "l") { currentTargetPos0 -= turn; currentTargetPos1 -= turn; }
   else if (cmd == "r") { currentTargetPos0 += turn; currentTargetPos1 += turn; }
-  else if (cmd == "s") { 
-    odriveSerial.println("v 0 0"); 
-    odriveSerial.println("v 1 0"); 
-    return; 
-  } 
-  else { odriveSerial.println(cmd); return; }
 
-  odriveSerial.printf("t 0 %.2f\n", currentTargetPos0);
-  odriveSerial.printf("t 1 %.2f\n", currentTargetPos1);
+  odriveSerial.printf("t 0 %.3f\n", currentTargetPos0);
+  odriveSerial.printf("t 1 %.3f\n", currentTargetPos1);
 }
 
 void subscription_callback(const void * msgin) {
